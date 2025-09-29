@@ -1,0 +1,63 @@
+# GPUConductor 生产环境配置
+
+# 服务器配置
+server:
+  port: "8080"
+  database: "host=localhost user=gcond password=gcond dbname=gcond port=5432 sslmode=disable"
+  redis: "localhost:6379"
+
+# LDAP 认证配置
+ldap:
+  host: "localhost"
+  port: 389
+  base_dn: "dc=gpuconductor,dc=local"
+  user_dn: "uid=%s,ou=users,dc=gpuconductor,dc=local"
+  bind_dn: "cn=admin,dc=gpuconductor,dc=local"
+  bind_pass: "admin_password"
+
+# JWT 令牌配置
+jwt:
+  secret: "your-secret-key-change-in-production"
+  expiration_hours: 24
+  refresh_expiration_days: 7
+
+# 日志配置
+log:
+  level: "info"
+  file: "gcond.log"
+  format: "json"
+
+# 调度器配置
+scheduler:
+  interval: 5
+  max_concurrent_tasks: 100
+  default_timeout: 3600
+  retry_attempts: 3
+
+# GPU 监控配置
+gpu:
+  monitor_interval: 10
+  nvidia_smi_path: "nvidia-smi"
+  memory_threshold: 90
+  utilization_threshold: 95
+
+# Docker 配置
+docker:
+  endpoint: "unix:///var/run/docker.sock"
+  api_version: "1.41"
+  timeout: 60
+  pull_timeout: 300
+  cleanup_containers: true
+
+# 安全配置
+security:
+  enable_cors: true
+  cors_origins: ["*"]
+  rate_limit: 100
+  max_request_size: "10MB"
+
+# 监控配置
+monitoring:
+  enable_metrics: true
+  metrics_port: "9090"
+  health_check_interval: 30

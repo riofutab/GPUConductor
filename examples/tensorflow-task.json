@@ -1,0 +1,19 @@
+{
+  "name": "TensorFlow 模型训练",
+  "description": "使用 TensorFlow 训练深度学习模型",
+  "image": "tensorflow/tensorflow:2.13.0-gpu",
+  "command": "python -c \"import tensorflow as tf; print('TensorFlow version:', tf.__version__); print('GPU devices:', tf.config.list_physical_devices('GPU'))\"",
+  "priority": 1,
+  "gpu_count": 2,
+  "gpu_memory": 8192,
+  "max_duration": 120,
+  "environment": {
+    "TF_CPP_MIN_LOG_LEVEL": "2",
+    "CUDA_VISIBLE_DEVICES": "0,1"
+  },
+  "volumes": [
+    "/data/datasets:/workspace/data",
+    "/data/checkpoints:/workspace/checkpoints"
+  ],
+  "node_tags": ["gpu", "tensorflow"]
+}

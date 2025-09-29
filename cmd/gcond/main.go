@@ -5,8 +5,6 @@ import (
 	"log"
 )
 
-var Version = "dev"
-
 func main() {
 	if err := cmd.Execute(); err != nil {
 		log.Fatal(err)

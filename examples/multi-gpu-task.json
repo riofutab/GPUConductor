@@ -1,0 +1,22 @@
+{
+  "name": "多GPU分布式训练",
+  "description": "使用多个GPU进行分布式模型训练",
+  "image": "nvcr.io/nvidia/pytorch:23.08-py3",
+  "command": "torchrun --nproc_per_node=4 train_distributed.py --epochs 100 --batch-size 256",
+  "priority": 3,
+  "gpu_count": 4,
+  "gpu_memory": 16384,
+  "max_duration": 480,
+  "environment": {
+    "MASTER_ADDR": "localhost",
+    "MASTER_PORT": "12355",
+    "WORLD_SIZE": "4",
+    "NCCL_DEBUG": "INFO"
+  },
+  "volumes": [
+    "/shared/datasets:/workspace/data",
+    "/shared/models:/workspace/models",
+    "/shared/logs:/workspace/logs"
+  ],
+  "node_tags": ["gpu", "multi-gpu", "distributed"]
+}

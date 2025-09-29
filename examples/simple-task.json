@@ -1,0 +1,19 @@
+{
+  "name": "PyTorch CIFAR-10 训练",
+  "description": "使用 PyTorch 训练 CIFAR-10 图像分类模型",
+  "image": "pytorch/pytorch:2.0.1-cuda11.7-cudnn8-runtime",
+  "command": "python -c \"import torch; import torchvision; print('PyTorch version:', torch.__version__); print('CUDA available:', torch.cuda.is_available()); print('GPU count:', torch.cuda.device_count())\"",
+  "priority": 2,
+  "gpu_count": 1,
+  "gpu_memory": 4096,
+  "max_duration": 60,
+  "environment": {
+    "CUDA_VISIBLE_DEVICES": "0",
+    "PYTHONUNBUFFERED": "1"
+  },
+  "volumes": [
+    "/tmp/data:/workspace/data",
+    "/tmp/models:/workspace/models"
+  ],
+  "node_tags": ["gpu", "pytorch"]
+}

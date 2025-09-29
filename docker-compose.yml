@@ -1,0 +1,128 @@
+version: '3.8'
+
+services:
+  # PostgreSQL 数据库
+  postgres:
+    image: postgres:15-alpine
+    container_name: gpuconductor-postgres
+    restart: unless-stopped
+    environment:
+      - POSTGRES_DB=gcond
+      - POSTGRES_USER=gcond
+      - POSTGRES_PASSWORD=gcond
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U gcond"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Redis 消息队列
+  redis:
+    image: redis:7-alpine
+    container_name: gpuconductor-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # LDAP 服务器
+  ldap:
+    image: osixia/openldap:1.5.0
+    container_name: gpuconductor-ldap
+    restart: unless-stopped
+    environment:
+      - LDAP_ORGANISATION=GPUConductor Inc.
+      - LDAP_DOMAIN=gpuconductor.local
+      - LDAP_ADMIN_PASSWORD=admin_password
+      - LDAP_CONFIG_PASSWORD=config_password
+    ports:
+      - "389:389"
+      - "636:636"
+    volumes:
+      - ldap_data:/var/lib/ldap
+      - ldap_config:/etc/ldap/slapd.d
+    command: --copy-service
+
+  # LDAP 管理界面
+  ldap-admin:
+    image: osixia/phpldapadmin:0.9.0
+    container_name: gpuconductor-ldap-admin
+    restart: unless-stopped
+    environment:
+      - PHPLDAPADMIN_LDAP_HOSTS=ldap
+      - PHPLDAPADMIN_HTTPS=false
+    ports:
+      - "8081:80"
+    depends_on:
+      - ldap
+
+  # GPUConductor 服务器
+  server:
+    build: .
+    container_name: gpuconductor-server
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./data:/app/data
+      - ./config.yaml:/app/config.yaml
+    environment:
+      - DATABASE_URL=host=postgres user=gcond password=gcond dbname=gcond port=5432 sslmode=disable
+      - REDIS_URL=redis:6379
+      - LDAP_HOST=ldap
+      - LDAP_PORT=389
+      - LDAP_BASE_DN=dc=gpuconductor,dc=local
+      - LDAP_USER_DN=uid=%s,ou=users,dc=gpuconductor,dc=local
+      - LDAP_BIND_DN=cn=admin,dc=gpuconductor,dc=local
+      - LDAP_BIND_PASS=admin_password
+      - JWT_SECRET=your-secret-key-change-in-production
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      ldap:
+        condition: service_started
+    command: ["./gcond", "server", "--port", "8080", "--database", "host=postgres user=gcond password=gcond dbname=gcond port=5432 sslmode=disable", "--redis", "redis:6379"]
+
+  # GPUConductor Agent (示例，需要在 GPU 机器上运行)
+  # agent:
+  #   build: .
+  #   container_name: gpuconductor-agent
+  #   restart: unless-stopped
+  #   volumes:
+  #     - /var/run/docker.sock:/var/run/docker.sock
+  #     - ./config.yaml:/app/config.yaml
+  #   environment:
+  #     - SERVER_URL=http://server:8080
+  #   depends_on:
+  #     - server
+  #   deploy:
+  #     resources:
+  #       reservations:
+  #         devices:
+  #           - driver: nvidia
+  #             count: all
+  #             capabilities: [gpu]
+  #   command: ["./gcond", "agent", "--server", "http://server:8080"]
+
+volumes:
+  postgres_data:
+  redis_data:
+  ldap_data:
+  ldap_config:
+
+networks:
+  default:
+    name: gpuconductor-network
