@@ -8,6 +8,13 @@ import (
 	"github.com/spf13/viper"
 )
 
+// 版本信息
+var (
+	version   = "dev"
+	commit    = "unknown"
+	buildTime = "unknown"
+)
+
 var cfgFile string
 
 var rootCmd = &cobra.Command{
@@ -20,13 +27,36 @@ var rootCmd = &cobra.Command{
 - Docker容器执行`,
 }
 
+var versionCmd = &cobra.Command{
+	Use:   "version",
+	Short: "显示版本信息",
+	Run: func(cmd *cobra.Command, args []string) {
+		fmt.Printf("GPUConductor %s\n", version)
+		fmt.Printf("Commit: %s\n", commit)
+		fmt.Printf("Build Time: %s\n", buildTime)
+	},
+}
+
+// SetVersionInfo 设置版本信息
+func SetVersionInfo(v, c, bt string) {
+	version = v
+	commit = c
+	buildTime = bt
+}
+
 func Execute() error {
 	return rootCmd.Execute()
 }
 
 func init() {
 	cobra.OnInitialize(initConfig)
+	
+	rootCmd.AddCommand(versionCmd)
+	
 	rootCmd.PersistentFlags().StringVar(&cfgFile, "config", "", "配置文件路径 (默认: $HOME/.gcond.yaml)")
+	rootCmd.PersistentFlags().Bool("debug", false, "启用调试模式")
+	
+	viper.BindPFlag("debug", rootCmd.PersistentFlags().Lookup("debug"))
 }
 
 func initConfig() {

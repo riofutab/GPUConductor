@@ -83,7 +83,7 @@ services:
       - LDAP_HOST=ldap
       - LDAP_PORT=389
       - LDAP_BASE_DN=dc=gpuconductor,dc=local
-      - LDAP_USER_DN=uid=%s,ou=users,dc=gpuconductor,dc=local
+      - LDAP_USER_DN=mobile=%s,ou=users,dc=gpuconductor,dc=local
       - LDAP_BIND_DN=cn=admin,dc=gpuconductor,dc=local
       - LDAP_BIND_PASS=admin_password
       - JWT_SECRET=your-secret-key-change-in-production

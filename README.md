@@ -1,216 +1,165 @@
 # GPUConductor
 
-GPUConductor 是一个分布式 GPU 任务调度系统，支持多台机器部署、统一界面访问，可以监控 GPU 使用率并根据使用率进行算法模型训练任务排队。
+一个分布式GPU任务调度系统，支持多机器部署、统一界面访问，可以根据GPU使用率进行算法模型训练任务排队。
 
 ## 功能特性
 
-- 🖥️ **多机器部署支持** - 支持多台 GPU 机器的统一管理
-- 📊 **GPU 监控** - 实时监控 GPU 使用率、内存、温度等指标
-- 🔄 **智能任务调度** - 基于 GPU 使用率的自动任务排队和调度
-- 🎯 **优先级管理** - 支持任务优先级设置和机器绑定
-- ⏱️ **超时控制** - 任务最大执行时间限制
-- 🐳 **Docker 支持** - 支持使用 Docker 镜像执行训练任务
-- 🔐 **LDAP 认证** - 集成 LDAP 用户认证系统
-- 🌐 **Web 界面** - 基于 Vue.js 的现代化 Web 管理界面
-- 📡 **实时通信** - WebSocket 实时数据推送
-- 🗄️ **PostgreSQL** - 使用 PostgreSQL 作为主数据库
+- 🚀 **分布式部署**: 主控 + 多 Agent 结构，按节点标签调度
+- 📊 **GPU监控**: 实时采集节点 GPU 使用率、温度、显存等指标
+- 🎯 **智能调度**: 按优先级、标签、资源需求分配任务
+- ⏱️ **时间控制**: 约束最大运行时间并支持任务取消
+- 🐳 **容器化执行**: 自动挂载数据集/输出目录，记录容器日志
+- ☁️ **模型归档**: 任务完成后自动上传模型到 MinIO/S3
+- 🔐 **安全认证**: JWT + LDAP（可选）
 
 ## 系统架构
 
 ```
-┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐
-│   Web Browser   │    │     LDAP        │    │   PostgreSQL    │
-│                 │    │   Directory     │    │    Database     │
-└─────────┬───────┘    └─────────┬───────┘    └─────────┬───────┘
-          │                      │                      │
-          │ HTTP/WebSocket       │ LDAP Auth           │ SQL
-          │                      │                      │
-┌─────────▼──────────────────────▼──────────────────────▼───────┐
-│                    GPUConductor Server                        │
-│  ┌─────────────┐ ┌─────────────┐ ┌─────────────────────────┐  │
-│  │   Web UI    │ │    API      │ │      Scheduler          │  │
-│  │   (Vue.js)  │ │  (Gin/Go)   │ │    (Task Queue)         │  │
-│  └─────────────┘ └─────────────┘ └─────────────────────────┘  │
-└─────────┬──────────────────────────────────────────────┬─────┘
-          │                                              │
-          │ Redis (Message Queue)                        │
-          │                                              │
-┌─────────▼───────┐                           ┌─────────▼───────┐
-│  GPU Node 1     │                           │  GPU Node N     │
-│ ┌─────────────┐ │                           │ ┌─────────────┐ │
-│ │   Agent     │ │            ...            │ │   Agent     │ │
-│ │   (Go)      │ │                           │ │   (Go)      │ │
-│ └─────────────┘ │                           │ └─────────────┘ │
-│ ┌─────────────┐ │                           │ ┌─────────────┐ │
-│ │   Docker    │ │                           │ │   Docker    │ │
-│ │  Containers │ │                           │ │  Containers │ │
-│ └─────────────┘ │                           │ └─────────────┘ │
-│ ┌─────────────┐ │                           │ ┌─────────────┐ │
-│ │    GPUs     │ │                           │ │    GPUs     │ │
-│ └─────────────┘ │                           │ └─────────────┘ │
-└─────────────────┘                           └─────────────────┘
+GPUConductor
+├── 中央服务器 (Master)
+│   ├── API服务
+│   ├── 调度器
+│   └── 数据库/Redis
+└── 节点代理 (Agent)
+    ├── GPU监控
+    ├── 容器管理
+    └── 心跳检测
 ```
 
 ## 快速开始
 
-### 1. 构建项目
+### 环境要求
 
+- Go 1.19+
+- Docker
+- NVIDIA驱动和nvidia-smi
+- Redis (可选)
+
+### 安装部署
+
+1. **克隆项目**
 ```bash
-# 下载依赖
-go mod tidy
-
-# 构建可执行文件
-go build -o build/gcond.exe cmd/gcond/main.go  # Windows
-go build -o build/gcond cmd/gcond/main.go      # Linux/macOS
+git clone <repository-url>
+cd GPUConductor
 ```
 
-### 2. 配置系统
-
-复制并编辑配置文件：
-
+2. **构建项目**
 ```bash
-cp config/server.example.yaml config.yaml
+# Windows
+build.bat
+
+# Linux/Mac
+chmod +x build.sh
+./build.sh
 ```
 
-主要配置项：
+3. **启动服务器**
+```bash
+# 启动中央服务器
+gcond.exe
+
+# 启动节点代理 (在其他机器上)
+set GCOND_MODE=agent
+gcond.exe
+```
+
+4. **验证 API / 启动 Agent**
+```bash
+# 验证健康状态
+curl http://localhost:8080/api/v1/health
+
+# 在节点机器上启动 Agent
+./gcond agent --config config/agent.yaml
+```
+默认管理员账号: `admin` / `admin123`
+
+## 配置说明
+
+### 主要配置项
 
 ```yaml
-# 数据库配置
+# 服务器配置
 server:
-  database: "host=localhost user=gcond password=gcond dbname=gcond port=5432 sslmode=disable"
+  host: "0.0.0.0"
+  port: 8080
 
-# LDAP 配置
-ldap:
-  host: "your-ldap-server"
-  base_dn: "dc=yourcompany,dc=com"
-  bind_dn: "cn=admin,dc=yourcompany,dc=com"
-  bind_pass: "your-admin-password"
+# GPU监控
+gpu:
+  monitor_interval: 5
+  utilization_threshold: 20
 
-# JWT 配置
-jwt:
-  secret: "your-secret-key-change-in-production"
+# 任务调度
+scheduler:
+  max_concurrent_tasks: 4
+  task_timeout: 3600
 ```
 
-### 3. 启动系统
+### 节点标签
 
-#### 方式一：使用启动脚本
+节点支持标签系统，用于任务绑定：
 
-**Windows:**
-```powershell
-.\start.ps1
-```
+- `gpu-v100`: V100 GPU节点
+- `gpu-a100`: A100 GPU节点  
+- `high-memory`: 大内存节点
+- `fast-network`: 高速网络节点
 
-**Linux/macOS:**
-```bash
-chmod +x start.sh
-./start.sh
-```
+## API接口
 
-#### 方式二：手动启动
+### 认证接口
+- `POST /api/login` - 用户登录
+- `POST /api/register` - 用户注册
 
-**启动服务器:**
-```bash
-.\build\gcond.exe server --config config.yaml
-```
+### 任务管理
+- `GET /api/tasks` - 获取任务列表
+- `POST /api/tasks` - 创建新任务
+- `GET /api/tasks/:id` - 获取任务详情
+- `POST /api/tasks/:id/cancel` - 取消任务
 
-**启动 Agent (在 GPU 机器上):**
-```bash
-.\build\gcond.exe agent --server http://your-server:8080 --node-id gpu-node-1
-```
+### GPU监控
+- `GET /api/gpu/stats` - 获取GPU状态
+- `GET /api/nodes` - 获取节点列表
 
-#### 方式三：使用 Docker Compose
-
-```bash
-docker-compose up -d
-```
-
-这将启动完整的环境，包括：
-- GPUConductor 服务器 (端口 8080)
-- PostgreSQL 数据库 (端口 5432)
-- Redis 缓存 (端口 6379)
-- LDAP 服务器 (端口 389)
-- LDAP 管理界面 (端口 8081)
-
-### 4. 访问系统
-
-- **Web 管理界面**: http://localhost:8080
-- **LDAP 管理界面**: http://localhost:8081 (用户名: cn=admin,dc=gpuconductor,dc=local, 密码: admin_password)
-
-## 使用指南
+## 任务配置示例
 
 ### 创建训练任务
 
-1. 登录 Web 界面
-2. 进入"任务管理"页面
-3. 点击"创建任务"
-4. 填写任务信息：
-   - 任务名称和描述
-   - Docker 镜像
-   - 执行命令
-   - 优先级 (低/普通/高/紧急)
-   - 最大执行时间
-   - 指定节点 (可选)
-
-### 监控 GPU 状态
-
-1. 进入"仪表板"查看整体状态
-2. 进入"节点管理"查看详细的 GPU 信息
-3. 实时数据通过 WebSocket 自动更新
-
-### 管理用户
-
-用户通过 LDAP 进行认证，首次登录时会自动创建用户记录。
-
-## API 文档
-
-### 认证 API
-
-```bash
-# 用户登录
-POST /api/v1/auth/login
+```json
 {
-  "username": "your-username",
-  "password": "your-password"
-}
-
-# 刷新令牌
-POST /api/v1/auth/refresh
-{
-  "refresh_token": "your-refresh-token"
+  "name": "图像分类训练",
+  "image": "gpuconductor/train:latest",
+  "command": "python main.py",
+  "dataset_path": "/data/datasets/imagenet",
+  "model_output_path": "/data/output/run-001",
+  "minio_endpoint": "https://minio.example.com",
+  "minio_bucket": "ml-artifacts",
+  "minio_access_key": "AK",
+  "minio_secret_key": "SK",
+  "script_path": "scripts/train.sh",
+  "iterations": 200,
+  "gpu_count": 2,
+  "max_duration": 7200,
+  "node_tags": ["gpu-4090", "linux"]
 }
 ```
 
-### 任务 API
+字段说明：
 
-```bash
-# 获取任务列表
-GET /api/v1/tasks
+| 字段 | 说明 |
+|------|------|
+| `dataset_path` | 节点可访问的数据集目录，会被挂载到容器 `/workspace/dataset` |
+| `model_output_path` | 模型/日志输出目录，任务完成后上传至 MinIO |
+| `script_path` | 容器内需要执行的脚本路径（传给 entrypoint） |
+| `iterations` | 训练迭代或 epoch 数，会注入 `TRAINING_ITERATIONS` |
+| `minio_*` | MinIO 访问参数，配合模型上传使用 |
+| `gpu_count`、`max_duration` 等 | 控制资源和最长运行时长 |
 
-# 创建任务
-POST /api/v1/tasks
-{
-  "name": "训练任务",
-  "description": "模型训练",
-  "image": "pytorch/pytorch:latest",
-  "command": "python train.py",
-  "priority": "high",
-  "timeout": 3600,
-  "node_id": "gpu-node-1"
-}
+### 任务状态
 
-# 取消任务
-POST /api/v1/tasks/{id}/cancel
-```
-
-### 节点 API
-
-```bash
-# 获取节点列表
-GET /api/v1/nodes
-
-# 节点心跳
-POST /api/v1/nodes/{id}/heartbeat
-```
+- `pending`: 等待中
+- `running`: 运行中  
+- `completed`: 已完成
+- `failed`: 失败
+- `cancelled`: 已取消
 
 ## 开发指南
 
@@ -218,101 +167,81 @@ POST /api/v1/nodes/{id}/heartbeat
 
 ```
 GPUConductor/
-├── cmd/gcond/           # 主程序入口
 ├── internal/
-│   ├── api/            # API 处理器
-│   ├── auth/           # 认证模块
-│   ├── cmd/            # 命令行处理
-│   ├── middleware/     # 中间件
-│   ├── models/         # 数据模型
-│   ├── scheduler/      # 任务调度器
-│   ├── server/         # HTTP 服务器
-│   └── agent/          # Agent 客户端
-├── web/                # 前端文件
-├── config/             # 配置文件
-├── build/              # 构建输出
-└── docker-compose.yml  # Docker 编排
+│   ├── api/          # API处理器
+│   ├── agent/        # 节点代理
+│   ├── docker/       # Docker管理
+│   ├── models/       # 数据模型
+│   └── scheduler/    # 任务调度
+├── config/           # server/agent 配置
+├── training-image/   # 训练镜像模板
+└── main.go           # 程序入口
+
+### 训练镜像模板
+
+`training-image/` 目录提供了默认镜像（Python 3.11 + uv）：
+
+```bash
+cd training-image
+docker build -t gpuconductor/train:latest .
 ```
 
-### 添加新功能
+镜像会读取以下环境变量：
 
-1. 在 `internal/models/` 中定义数据模型
-2. 在 `internal/api/` 中添加 API 处理器
-3. 在 `internal/server/` 中注册路由
-4. 在 `web/dist/index.html` 中添加前端界面
+- `DATASET_PATH`（默认 `/workspace/dataset`）
+- `MODEL_OUTPUT_PATH`（默认 `/workspace/output`）
+- `TRAINING_SCRIPT`（优先执行）
+- `TRAINING_ITERATIONS`
+- `MINIO_*`（用于脚本自行上传）
 
-## 部署指南
+你可以基于此镜像添加 `requirements.txt`、`scripts/train.sh` 等自定义逻辑。
+```
 
-### 生产环境部署
+### 添加新的API接口
 
-1. **安全配置**
-   - 更改默认的 JWT 密钥
-   - 配置 HTTPS
-   - 设置防火墙规则
-
-2. **数据库配置**
-   - 使用独立的 PostgreSQL 服务器
-   - 配置数据库备份
-   - 优化数据库性能
-
-3. **监控配置**
-   - 启用指标收集
-   - 配置日志轮转
-   - 设置告警通知
-
-### 高可用部署
-
-1. **负载均衡**
-   - 使用 Nginx 或 HAProxy
-   - 配置多个服务器实例
-
-2. **数据库高可用**
-   - PostgreSQL 主从复制
-   - 连接池配置
-
-3. **缓存高可用**
-   - Redis 集群或哨兵模式
+1. 在 `internal/api/` 创建新的处理器
+2. 在 `main.go` 中注册路由
+3. 更新前端界面调用新接口
 
 ## 故障排除
 
 ### 常见问题
 
-1. **无法连接数据库**
-   - 检查 PostgreSQL 服务是否运行
-   - 验证连接字符串配置
-   - 检查网络连接
+1. **GPU监控不工作**
+   - 检查nvidia-smi是否可用
+   - 验证NVIDIA驱动版本
 
-2. **LDAP 认证失败**
-   - 验证 LDAP 服务器配置
-   - 检查用户 DN 格式
-   - 确认管理员凭据
+2. **Docker容器启动失败**
+   - 检查Docker服务状态
+   - 验证训练镜像是否存在
 
-3. **GPU 监控异常**
-   - 确认 nvidia-smi 可用
-   - 检查 Agent 与服务器连接
-   - 验证 Docker 权限
+3. **节点连接失败**
+   - 检查网络连通性
+   - 验证防火墙设置
 
 ### 日志查看
 
+日志文件位置: `gcond.log`
+
 ```bash
-# 查看服务器日志
+# 查看实时日志
 tail -f gcond.log
-
-# 查看 Docker 容器日志
-docker-compose logs -f gcond
 ```
-
-## 贡献指南
-
-1. Fork 项目
-2. 创建功能分支
-3. 提交更改
-4. 创建 Pull Request
 
 ## 许可证
 
 MIT License
 
+## 贡献
+
+欢迎提交Issue和Pull Request！
+
 ## 联系方式
 
-如有问题或建议，请创建 Issue 或联系项目维护者。
+- 项目主页: [GitHub Repository]
+- 问题反馈: [Issues]
+- 文档: [Wiki]
+
+---
+
+**GPUConductor** - 让GPU任务调度更简单高效！

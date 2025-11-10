@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"strings"
 	"time"
 
 	"github.com/go-redis/redis/v8"
@@ -126,21 +127,17 @@ func (s *Scheduler) findAvailableNode(task *models.Task) *models.Node {
 		query = query.Where("id = ?", task.NodeID)
 	}
 
-	// 如果指定了节点标签
-	if len(task.NodeTags) > 0 {
-		for _, tag := range task.NodeTags {
-			query = query.Where("JSON_EXTRACT(tags, '$') LIKE ?", "%"+tag+"%")
-		}
-	}
-
 	var nodes []models.Node
 	if err := query.Preload("GPUs").Find(&nodes).Error; err != nil {
 		log.Printf("查询节点失败: %v", err)
 		return nil
 	}
 
-	// 按优先级排序，选择GPU资源充足的节点
 	for _, node := range nodes {
+		if len(task.NodeTags) > 0 && !nodeHasTags(node.Tags, task.NodeTags) {
+			continue
+		}
+
 		if s.hasEnoughGPUResources(&node, task) {
 			return &node
 		}
@@ -257,4 +254,23 @@ func (s *Scheduler) publishTaskEvent(task *models.Task, event string) {
 	}
 
 	s.redisClient.Publish(s.ctx, "task_events", data)
+}
+
+func nodeHasTags(nodeTags []string, required []string) bool {
+	if len(required) == 0 {
+		return true
+	}
+
+	tagSet := make(map[string]struct{}, len(nodeTags))
+	for _, tag := range nodeTags {
+		tagSet[strings.TrimSpace(tag)] = struct{}{}
+	}
+
+	for _, tag := range required {
+		if _, ok := tagSet[strings.TrimSpace(tag)]; !ok {
+			return false
+		}
+	}
+
+	return true
 }

@@ -2,13 +2,21 @@ package main
 
 import (
 	"GPUConductor/internal/cmd"
-	"log"
+	"fmt"
+	"os"
 )
 
-var Version = "dev"
+var (
+	Version   = "dev"
+	Commit    = "unknown"
+	BuildTime = "unknown"
+)
 
 func main() {
+	cmd.SetVersionInfo(Version, Commit, BuildTime)
+
 	if err := cmd.Execute(); err != nil {
-		log.Fatal(err)
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
 	}
 }

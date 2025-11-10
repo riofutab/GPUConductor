@@ -1,0 +1,113 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, master, develop ]
+  pull_request:
+    branches: [ main, master ]
+
+env:
+  GO_VERSION: '1.21'
+
+jobs:
+  test:
+    name: Test and Lint
+    runs-on: ubuntu-latest
+    
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: gcond_test
+          POSTGRES_USER: postgres
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+      
+      redis:
+        image: redis:7-alpine
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 6379:6379
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Set up Go
+      uses: actions/setup-go@v4
+      with:
+        go-version: ${{ env.GO_VERSION }}
+        cache: true
+    
+    - name: Download dependencies
+      run: go mod download
+    
+    - name: Verify dependencies
+      run: go mod verify
+    
+    - name: Run go vet
+      run: go vet ./...
+    
+    - name: Run tests
+      run: go test -v -race -coverprofile=coverage.out ./...
+      env:
+        DATABASE_URL: postgres://postgres:postgres@localhost:5432/gcond_test?sslmode=disable
+        REDIS_URL: localhost:6379
+    
+    - name: Upload coverage to Codecov
+      uses: codecov/codecov-action@v3
+      with:
+        file: ./coverage.out
+        flags: unittests
+        name: codecov-umbrella
+    
+    - name: Run golangci-lint
+      uses: golangci/golangci-lint-action@v3
+      with:
+        version: latest
+        args: --timeout=5m
+
+  build-test:
+    name: Build Test
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Set up Go
+      uses: actions/setup-go@v4
+      with:
+        go-version: ${{ env.GO_VERSION }}
+        cache: true
+    
+    - name: Test build for Linux
+      env:
+        GOOS: linux
+        GOARCH: amd64
+        CGO_ENABLED: 0
+      run: |
+        go build -ldflags="-s -w" -o gcond-test cmd/gcond/main.go
+        ./gcond-test --version || echo "Version command not implemented yet"
+        ./gcond-test --help
+    
+    - name: Test cross-compilation
+      run: |
+        # Test Windows build
+        GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -o gcond-windows.exe cmd/gcond/main.go
+        
+        # Test macOS build  
+        GOOS=darwin GOARCH=amd64 CGO_ENABLED=0 go build -o gcond-darwin cmd/gcond/main.go
+        
+        echo "Cross-compilation successful!"
+        ls -la gcond-*

@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"GPUConductor/internal/agent"
+	"GPUConductor/internal/config"
 	"log"
 	"os"
 
@@ -14,23 +15,30 @@ var agentCmd = &cobra.Command{
 	Short: "启动GPUConductor代理节点",
 	Long:  `启动代理节点，监控本机GPU状态并执行任务`,
 	Run: func(cmd *cobra.Command, args []string) {
-		config := &agent.Config{
-			ServerURL: viper.GetString("agent.server"),
-			NodeName:  viper.GetString("agent.name"),
-			Tags:      viper.GetStringSlice("agent.tags"),
+		cfgPath, _ := cmd.Flags().GetString("config")
+		if cfgPath == "" {
+			cfgPath = viper.GetString("config")
+		}
+		if cfgPath == "" {
+			log.Fatal("请使用 --config 指定配置文件")
 		}
 
-		if config.ServerURL == "" {
-			config.ServerURL = "http://localhost:8080"
+		cfg, err := config.LoadConfig(cfgPath)
+		if err != nil {
+			log.Fatalf("加载配置失败: %v", err)
 		}
-		if config.NodeName == "" {
+
+		if cfg.Node.ServerURL == "" {
+			cfg.Node.ServerURL = "http://localhost:8080"
+		}
+		if cfg.Node.NodeName == "" {
 			hostname, _ := os.Hostname()
-			config.NodeName = hostname
+			cfg.Node.NodeName = hostname
 		}
 
-		agent := agent.New(config)
-		log.Printf("启动GPUConductor代理节点: %s", config.NodeName)
-		log.Printf("连接服务器: %s", config.ServerURL)
+		agent := agent.New(cfg)
+		log.Printf("启动GPUConductor代理节点: %s", cfg.NodeName)
+		log.Printf("连接服务器: %s", cfg.ServerURL)
 
 		if err := agent.Start(); err != nil {
 			log.Fatal("代理节点启动失败:", err)
@@ -40,11 +48,5 @@ var agentCmd = &cobra.Command{
 
 func init() {
 	rootCmd.AddCommand(agentCmd)
-	agentCmd.Flags().StringP("server", "s", "http://localhost:8080", "主服务器地址")
-	agentCmd.Flags().StringP("name", "n", "", "节点名称 (默认使用主机名)")
-	agentCmd.Flags().StringSliceP("tags", "t", []string{}, "节点标签")
-
-	viper.BindPFlag("agent.server", agentCmd.Flags().Lookup("server"))
-	viper.BindPFlag("agent.name", agentCmd.Flags().Lookup("name"))
-	viper.BindPFlag("agent.tags", agentCmd.Flags().Lookup("tags"))
+	agentCmd.Flags().StringP("config", "c", "", "配置文件路径")
 }
