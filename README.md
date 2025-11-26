@@ -45,26 +45,24 @@ cd GPUConductor
 
 2. **构建项目**
 ```bash
-# Windows
-build.bat
+# 编译后端
+export GOPATH=$PWD/.gopath
+export GOMODCACHE=$GOPATH/pkg/mod
+export GOCACHE=$PWD/.gocache
+go build -o gcond ./cmd/gcond
 
-# Linux/Mac
-chmod +x build.sh
-./build.sh
+# 构建前端（可选，用于嵌入 UI）
+cd webui
+npm install
+npm run build   # 输出到 ../ui-dist/
+cd ..
 ```
 
-3. **启动服务器**
+3. **启动服务器 / 验证**
 ```bash
 # 启动中央服务器
-gcond.exe
+./gcond server --config config/server.yaml
 
-# 启动节点代理 (在其他机器上)
-set GCOND_MODE=agent
-gcond.exe
-```
-
-4. **验证 API / 启动 Agent**
-```bash
 # 验证健康状态
 curl http://localhost:8080/api/v1/health
 
@@ -195,6 +193,18 @@ docker build -t gpuconductor/train:latest .
 - `MINIO_*`（用于脚本自行上传）
 
 你可以基于此镜像添加 `requirements.txt`、`scripts/train.sh` 等自定义逻辑。
+
+### 前端构建与部署
+
+Web UI 位于 `webui/`，使用 Vite + Vue 3：
+
+```bash
+cd webui
+npm install
+npm run build
+```
+
+构建后的静态文件会输出到 `ui-dist/`，主服务器启动时会自动检测该目录并提供 SPA；开发模式可执行 `npm run dev` 使用 Vite 的开发服务器。
 ```
 
 ### 添加新的API接口

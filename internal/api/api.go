@@ -7,37 +7,123 @@ import (
 	"GPUConductor/internal/scheduler"
 	"GPUConductor/internal/security"
 	"GPUConductor/internal/utils"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
+	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 type Handler struct {
 	db             *gorm.DB
 	scheduler      *scheduler.Scheduler
 	redisAddr      string
+	redisPassword  string
+	redisDB        int
 	heartbeatGrace time.Duration
 	logger         *zap.Logger
+	gitlabBaseURL  string
+	gitlabToken    string
+	ldapConfig     *auth.LDAPConfig
+	minioDefaults  MinioDefaults
 }
 
-func NewHandler(db *gorm.DB, sched *scheduler.Scheduler, redisAddr string, heartbeatGrace time.Duration) *Handler {
+type MinioDefaults struct {
+	Endpoint   string
+	AccessKey  string
+	SecretKey  string
+	Bucket     string
+}
+
+func NewHandler(db *gorm.DB, sched *scheduler.Scheduler, redisAddr string, redisPassword string, redisDB int, heartbeatGrace time.Duration) *Handler {
 	err := logger.InitLogger(false)
 	if err != nil {
 		panic(fmt.Sprintf("初始化日志失败: %v", err))
 	}
-	return &Handler{
+	h := &Handler{
 		db:             db,
 		scheduler:      sched,
 		redisAddr:      redisAddr,
+		redisPassword:  redisPassword,
+		redisDB:        redisDB,
 		heartbeatGrace: heartbeatGrace,
 		logger:         logger.Logger,
+		gitlabBaseURL:  defaultGitlabBase(),
+		gitlabToken:    os.Getenv("GITLAB_TOKEN"),
+		ldapConfig:     nil,
 	}
+	if db != nil {
+		h.loadGitlabConfig()
+		h.loadLDAPConfig()
+	}
+	h.minioDefaults = MinioDefaults{
+		Endpoint:  os.Getenv("MINIO_ENDPOINT"),
+		AccessKey: os.Getenv("MINIO_ACCESS_KEY"),
+		SecretKey: os.Getenv("MINIO_SECRET_KEY"),
+		Bucket:    os.Getenv("MINIO_BUCKET"),
+	}
+	return h
+}
+
+func defaultGitlabBase() string {
+	base := os.Getenv("GITLAB_BASE_URL")
+	if strings.TrimSpace(base) == "" {
+		return "https://gitlab.com"
+	}
+	return base
+}
+
+func (h *Handler) loadGitlabConfig() {
+	var base models.Setting
+	if err := h.db.Where("key = ?", "gitlab_base_url").First(&base).Error; err == nil && strings.TrimSpace(base.Value) != "" {
+		h.gitlabBaseURL = base.Value
+	}
+	var token models.Setting
+	if err := h.db.Where("key = ?", "gitlab_token").First(&token).Error; err == nil && strings.TrimSpace(token.Value) != "" {
+		h.gitlabToken = token.Value
+	}
+}
+
+func (h *Handler) loadLDAPConfig() {
+	var host, baseDN, userDN, bindDN, bindPass, userFilter models.Setting
+	_ = h.db.Where("key = ?", "ldap_host").First(&host).Error
+	_ = h.db.Where("key = ?", "ldap_base_dn").First(&baseDN).Error
+	_ = h.db.Where("key = ?", "ldap_user_dn").First(&userDN).Error
+	_ = h.db.Where("key = ?", "ldap_bind_dn").First(&bindDN).Error
+	_ = h.db.Where("key = ?", "ldap_bind_pass").First(&bindPass).Error
+	_ = h.db.Where("key = ?", "ldap_user_filter").First(&userFilter).Error
+
+	var portSetting models.Setting
+	_ = h.db.Where("key = ?", "ldap_port").First(&portSetting).Error
+	port, _ := strconv.Atoi(strings.TrimSpace(portSetting.Value))
+	if port == 0 {
+		port = 389
+	}
+
+	if strings.TrimSpace(host.Value) == "" {
+		return
+	}
+
+	cfg := &auth.LDAPConfig{
+		Host:       strings.TrimSpace(host.Value),
+		Port:       port,
+		BaseDN:     strings.TrimSpace(baseDN.Value),
+		UserDN:     strings.TrimSpace(userDN.Value),
+		BindDN:     strings.TrimSpace(bindDN.Value),
+		BindPass:   strings.TrimSpace(bindPass.Value),
+		UserFilter: strings.TrimSpace(userFilter.Value),
+	}
+	h.ldapConfig = cfg
+	auth.InitLDAP(cfg)
 }
 
 // ErrorResponse 错误响应
@@ -178,6 +264,195 @@ func (h *Handler) GetUserProfile(c *gin.Context) {
 	c.JSON(http.StatusOK, user)
 }
 
+// GetGitlabConfig 管理员查看GitLab配置（不返回真实token）
+func (h *Handler) GetGitlabConfig(c *gin.Context) {
+	if !h.requireAdmin(c) {
+		return
+	}
+	h.loadGitlabConfig()
+	c.JSON(http.StatusOK, gin.H{
+		"base_url":  h.gitlabBaseURL,
+		"token_set": h.gitlabToken != "",
+	})
+}
+
+// UpdateGitlabConfig 管理员更新GitLab配置
+func (h *Handler) UpdateGitlabConfig(c *gin.Context) {
+	if !h.requireAdmin(c) {
+		return
+	}
+
+	var req struct {
+		BaseURL string `json:"base_url"`
+		Token   string `json:"token"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, ErrorResponse{Error: "请求参数无效"})
+		return
+	}
+
+	if strings.TrimSpace(req.BaseURL) == "" {
+		req.BaseURL = defaultGitlabBase()
+	}
+
+	settings := []models.Setting{
+		{Key: "gitlab_base_url", Value: strings.TrimSpace(req.BaseURL)},
+	}
+	if strings.TrimSpace(req.Token) != "" {
+		settings = append(settings, models.Setting{Key: "gitlab_token", Value: strings.TrimSpace(req.Token)})
+	}
+
+	for _, s := range settings {
+		if err := h.db.Clauses(clause.OnConflict{
+			Columns:   []clause.Column{{Name: "key"}},
+			DoUpdates: clause.AssignmentColumns([]string{"value", "updated_at"}),
+		}).Create(&s).Error; err != nil {
+			h.logger.Error("保存GitLab配置失败", zap.Error(err))
+			c.JSON(http.StatusInternalServerError, ErrorResponse{Error: "保存失败"})
+			return
+		}
+	}
+
+	h.gitlabBaseURL = settings[0].Value
+	if len(settings) > 1 {
+		h.gitlabToken = settings[1].Value
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "已更新"})
+}
+
+// GetUsers 管理员获取用户列表
+func (h *Handler) GetUsers(c *gin.Context) {
+	if !h.requireAdmin(c) {
+		return
+	}
+
+	var users []models.User
+	if err := h.db.Select("id", "username", "display_name", "mobile", "email", "role", "status", "last_login_at").Find(&users).Error; err != nil {
+		h.logger.Error("查询用户列表失败", zap.Error(err))
+		c.JSON(http.StatusInternalServerError, ErrorResponse{Error: "系统错误"})
+		return
+	}
+
+	c.JSON(http.StatusOK, users)
+}
+
+// UpdateUserRole 管理员更新用户角色
+func (h *Handler) UpdateUserRole(c *gin.Context) {
+	if !h.requireAdmin(c) {
+		return
+	}
+
+	userID := c.Param("id")
+	var req struct {
+		Role string `json:"role" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, ErrorResponse{Error: "请求参数无效"})
+		return
+	}
+
+	role := strings.ToLower(strings.TrimSpace(req.Role))
+	if role != "admin" && role != "user" {
+		c.JSON(http.StatusBadRequest, ErrorResponse{Error: "角色必须为 admin 或 user"})
+		return
+	}
+
+	if err := h.db.Model(&models.User{}).Where("id = ?", userID).Update("role", role).Error; err != nil {
+		h.logger.Error("更新用户角色失败", zap.Error(err))
+		c.JSON(http.StatusInternalServerError, ErrorResponse{Error: "系统错误"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "更新成功"})
+}
+
+// GetLDAPConfig 管理员查看LDAP配置（密码不回显）
+func (h *Handler) GetLDAPConfig(c *gin.Context) {
+	if !h.requireAdmin(c) {
+		return
+	}
+	h.loadLDAPConfig()
+	cfg := h.ldapConfig
+	if cfg == nil {
+		cfg = &auth.LDAPConfig{}
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"host":         cfg.Host,
+		"port":         cfg.Port,
+		"base_dn":      cfg.BaseDN,
+		"user_dn":      cfg.UserDN,
+		"bind_dn":      cfg.BindDN,
+		"user_filter":  cfg.UserFilter,
+		"password_set": cfg.BindPass != "",
+	})
+}
+
+// UpdateLDAPConfig 管理员更新LDAP配置
+func (h *Handler) UpdateLDAPConfig(c *gin.Context) {
+	if !h.requireAdmin(c) {
+		return
+	}
+
+	var req struct {
+		Host       string `json:"host"`
+		Port       int    `json:"port"`
+		BaseDN     string `json:"base_dn"`
+		UserDN     string `json:"user_dn"`
+		BindDN     string `json:"bind_dn"`
+		BindPass   string `json:"bind_pass"`
+		UserFilter string `json:"user_filter"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, ErrorResponse{Error: "请求参数无效"})
+		return
+	}
+	if strings.TrimSpace(req.Host) == "" {
+		c.JSON(http.StatusBadRequest, ErrorResponse{Error: "LDAP Host 不能为空"})
+		return
+	}
+	if req.Port == 0 {
+		req.Port = 389
+	}
+
+	settings := []models.Setting{
+		{Key: "ldap_host", Value: strings.TrimSpace(req.Host)},
+		{Key: "ldap_port", Value: strconv.Itoa(req.Port)},
+		{Key: "ldap_base_dn", Value: strings.TrimSpace(req.BaseDN)},
+		{Key: "ldap_user_dn", Value: strings.TrimSpace(req.UserDN)},
+		{Key: "ldap_bind_dn", Value: strings.TrimSpace(req.BindDN)},
+		{Key: "ldap_user_filter", Value: strings.TrimSpace(req.UserFilter)},
+	}
+	if strings.TrimSpace(req.BindPass) != "" {
+		settings = append(settings, models.Setting{Key: "ldap_bind_pass", Value: req.BindPass})
+	}
+
+	for _, s := range settings {
+		if err := h.db.Clauses(clause.OnConflict{
+			Columns:   []clause.Column{{Name: "key"}},
+			DoUpdates: clause.AssignmentColumns([]string{"value", "updated_at"}),
+		}).Create(&s).Error; err != nil {
+			h.logger.Error("保存LDAP配置失败", zap.Error(err))
+			c.JSON(http.StatusInternalServerError, ErrorResponse{Error: "保存失败"})
+			return
+		}
+	}
+
+	cfg := &auth.LDAPConfig{
+		Host:       strings.TrimSpace(req.Host),
+		Port:       req.Port,
+		BaseDN:     strings.TrimSpace(req.BaseDN),
+		UserDN:     strings.TrimSpace(req.UserDN),
+		BindDN:     strings.TrimSpace(req.BindDN),
+		BindPass:   strings.TrimSpace(req.BindPass),
+		UserFilter: strings.TrimSpace(req.UserFilter),
+	}
+	h.ldapConfig = cfg
+	auth.InitLDAP(cfg)
+
+	c.JSON(http.StatusOK, gin.H{"message": "已更新"})
+}
+
 // GetNodes 获取节点列表
 func (h *Handler) GetNodes(c *gin.Context) {
 	var nodes []models.Node
@@ -233,12 +508,26 @@ func (h *Handler) CreateTask(c *gin.Context) {
 	var task models.Task
 	if err := c.ShouldBindJSON(&task); err != nil {
 		h.logger.Warn("创建任务参数验证失败", zap.Error(err))
-		c.JSON(http.StatusBadRequest, ErrorResponse{Error: "请求参数无效"})
+		c.JSON(http.StatusBadRequest, ErrorResponse{Error: err.Error()})
 		return
 	}
 
 	task.CreatedBy = userID.(string)
 	task.Status = "pending"
+
+	// 补全 MinIO 默认值，避免在表单中输入敏感信息
+	if task.MinioEndpoint == "" && h.minioDefaults.Endpoint != "" {
+		task.MinioEndpoint = h.minioDefaults.Endpoint
+	}
+	if task.MinioAccessKey == "" && h.minioDefaults.AccessKey != "" {
+		task.MinioAccessKey = h.minioDefaults.AccessKey
+	}
+	if task.MinioSecretKey == "" && h.minioDefaults.SecretKey != "" {
+		task.MinioSecretKey = h.minioDefaults.SecretKey
+	}
+	if task.MinioBucket == "" && h.minioDefaults.Bucket != "" {
+		task.MinioBucket = h.minioDefaults.Bucket
+	}
 
 	if h.scheduler != nil {
 		if err := h.scheduler.SubmitTask(&task); err != nil {
@@ -248,7 +537,7 @@ func (h *Handler) CreateTask(c *gin.Context) {
 		}
 	} else if err := h.db.Create(&task).Error; err != nil {
 		h.logger.Error("创建任务失败", zap.Error(err))
-		c.JSON(http.StatusInternalServerError, ErrorResponse{Error: "系统错误"})
+		c.JSON(http.StatusInternalServerError, ErrorResponse{Error: err.Error()})
 		return
 	}
 
@@ -315,7 +604,9 @@ func (h *Handler) GetTaskLogs(c *gin.Context) {
 	taskID := c.Param("id")
 
 	var logs []models.TaskLog
-	if err := h.db.Where("task_id = ?", taskID).Order("timestamp DESC").Find(&logs).Error; err != nil {
+	if err := h.db.Where("task_id = ?", taskID).
+		Order("timestamp ASC").
+		Find(&logs).Error; err != nil {
 		h.logger.Error("查询任务日志失败", zap.String("taskID", taskID), zap.Error(err))
 		c.JSON(http.StatusInternalServerError, ErrorResponse{Error: "系统错误"})
 		return
@@ -399,6 +690,133 @@ func (h *Handler) GetGPUStats(c *gin.Context) {
 	c.JSON(http.StatusOK, gpus)
 }
 
+// GetGitlabRepos 获取GitLab仓库列表（管理员）
+func (h *Handler) GetGitlabRepos(c *gin.Context) {
+	if !h.requireAdmin(c) {
+		return
+	}
+
+	if h.gitlabToken == "" {
+		c.JSON(http.StatusServiceUnavailable, ErrorResponse{Error: "GitLab 未配置令牌"})
+		return
+	}
+
+	groupID := strings.TrimSpace(c.Query("group_id"))
+	client := &http.Client{Timeout: 10 * time.Second}
+	url := fmt.Sprintf("%s/api/v4/projects?membership=true&simple=true&per_page=50", strings.TrimRight(h.gitlabBaseURL, "/"))
+	if groupID != "" {
+		url = fmt.Sprintf("%s/api/v4/groups/%s/projects?simple=true&per_page=50", strings.TrimRight(h.gitlabBaseURL, "/"), groupID)
+	}
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, ErrorResponse{Error: "创建请求失败"})
+		return
+	}
+	req.Header.Set("PRIVATE-TOKEN", h.gitlabToken)
+
+	resp, err := client.Do(req)
+	if err != nil {
+		h.logger.Error("请求GitLab失败", zap.Error(err))
+		c.JSON(http.StatusBadGateway, ErrorResponse{Error: "GitLab 请求失败"})
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(resp.Body)
+		h.logger.Warn("GitLab返回错误", zap.Int("status", resp.StatusCode), zap.ByteString("body", body))
+		c.JSON(http.StatusBadGateway, ErrorResponse{Error: "GitLab 返回错误"})
+		return
+	}
+
+	var projects []struct {
+		ID            int    `json:"id"`
+		Name          string `json:"name"`
+		PathWithNs    string `json:"path_with_namespace"`
+		HTTPURL       string `json:"http_url_to_repo"`
+		SSHURL        string `json:"ssh_url_to_repo"`
+		Visibility    string `json:"visibility"`
+		DefaultBranch string `json:"default_branch"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&projects); err != nil {
+		h.logger.Error("解析GitLab返回失败", zap.Error(err))
+		c.JSON(http.StatusInternalServerError, ErrorResponse{Error: "解析GitLab返回失败"})
+		return
+	}
+
+	result := make([]gin.H, 0, len(projects))
+	for _, p := range projects {
+		result = append(result, gin.H{
+			"id":             p.ID,
+			"name":           p.Name,
+			"path":           p.PathWithNs,
+			"http_url":       p.HTTPURL,
+			"ssh_url":        p.SSHURL,
+			"visibility":     p.Visibility,
+			"default_branch": p.DefaultBranch,
+		})
+	}
+
+	c.JSON(http.StatusOK, result)
+}
+
+// GetGitlabGroups 获取GitLab分组（管理员）
+func (h *Handler) GetGitlabGroups(c *gin.Context) {
+	if !h.requireAdmin(c) {
+		return
+	}
+
+	if h.gitlabToken == "" {
+		c.JSON(http.StatusServiceUnavailable, ErrorResponse{Error: "GitLab 未配置令牌"})
+		return
+	}
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	req, err := http.NewRequest("GET", fmt.Sprintf("%s/api/v4/groups?all_available=false&per_page=100", strings.TrimRight(h.gitlabBaseURL, "/")), nil)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, ErrorResponse{Error: "创建请求失败"})
+		return
+	}
+	req.Header.Set("PRIVATE-TOKEN", h.gitlabToken)
+
+	resp, err := client.Do(req)
+	if err != nil {
+		h.logger.Error("请求GitLab分组失败", zap.Error(err))
+		c.JSON(http.StatusBadGateway, ErrorResponse{Error: "GitLab 请求失败"})
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(resp.Body)
+		h.logger.Warn("GitLab分组返回错误", zap.Int("status", resp.StatusCode), zap.ByteString("body", body))
+		c.JSON(http.StatusBadGateway, ErrorResponse{Error: "GitLab 返回错误"})
+		return
+	}
+
+	var groups []struct {
+		ID       int    `json:"id"`
+		Name     string `json:"name"`
+		FullPath string `json:"full_path"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&groups); err != nil {
+		h.logger.Error("解析GitLab分组失败", zap.Error(err))
+		c.JSON(http.StatusInternalServerError, ErrorResponse{Error: "解析GitLab返回失败"})
+		return
+	}
+
+	result := make([]gin.H, 0, len(groups))
+	for _, g := range groups {
+		result = append(result, gin.H{
+			"id":        g.ID,
+			"name":      g.Name,
+			"full_path": g.FullPath,
+		})
+	}
+
+	c.JSON(http.StatusOK, result)
+}
+
 // UpdateNodeStatus 更新节点状态
 func (h *Handler) UpdateNodeStatus(c *gin.Context) {
 	nodeID := c.Param("id")
@@ -444,7 +862,11 @@ func (h *Handler) GetRedisConfig(c *gin.Context) {
 		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{"redis": h.redisAddr})
+	c.JSON(http.StatusOK, gin.H{
+		"redis":    h.redisAddr,
+		"password": h.redisPassword,
+		"db":       h.redisDB,
+	})
 }
 
 // NodeHeartbeat 处理节点心跳
@@ -525,12 +947,15 @@ func (h *Handler) UpdateTaskStatus(c *gin.Context) {
 	taskID := c.Param("id")
 
 	var req struct {
-		Status         string            `json:"status"`
-		AssignedNodeID string            `json:"assigned_node_id"`
-		ContainerID    string            `json:"container_id"`
-		ExitCode       *int              `json:"exit_code"`
-		ErrorMessage   string            `json:"error_message"`
-		Environment    map[string]string `json:"environment"`
+		Status         string             `json:"status"`
+		AssignedNodeID string             `json:"assigned_node_id"`
+		ContainerID    string             `json:"container_id"`
+		ExitCode       *int               `json:"exit_code"`
+		ErrorMessage   string             `json:"error_message"`
+		CurrentIter    *int               `json:"current_iteration"`
+		Metrics        map[string]float64 `json:"metrics"`
+		Environment    map[string]string  `json:"environment"`
+		Logs           string             `json:"logs"`
 	}
 
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -572,6 +997,23 @@ func (h *Handler) UpdateTaskStatus(c *gin.Context) {
 	}
 	if req.Environment != nil {
 		task.Environment = req.Environment
+	}
+	if req.CurrentIter != nil {
+		task.CurrentIteration = *req.CurrentIter
+	}
+	if req.Metrics != nil {
+		task.Metrics = req.Metrics
+	}
+
+	// 追加容器日志
+	if strings.TrimSpace(req.Logs) != "" {
+		logEntry := models.TaskLog{
+			TaskID:  task.ID,
+			Content: req.Logs,
+		}
+		if err := h.db.Create(&logEntry).Error; err != nil {
+			h.logger.Warn("写入任务日志失败", zap.String("taskID", taskID), zap.Error(err))
+		}
 	}
 
 	if err := h.db.Save(&task).Error; err != nil {
@@ -622,4 +1064,13 @@ func (h *Handler) AuthMiddleware() gin.HandlerFunc {
 
 		c.Next()
 	}
+}
+
+func (h *Handler) requireAdmin(c *gin.Context) bool {
+	role, _ := c.Get("role")
+	if role == "admin" {
+		return true
+	}
+	c.JSON(http.StatusForbidden, ErrorResponse{Error: "需要管理员权限"})
+	return false
 }

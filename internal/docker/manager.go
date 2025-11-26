@@ -57,19 +57,17 @@ func (dm *DockerManager) StartContainer(task *models.Task, gpuDevices []string) 
 	}
 
 	if len(gpuDevices) > 0 {
-		hostConfig.Resources = container.Resources{
-			DeviceRequests: []container.DeviceRequest{
-				{
-					Driver:       "nvidia",
-					Count:        len(gpuDevices),
-					DeviceIDs:    gpuDevices,
-					Capabilities: [][]string{{"gpu"}},
-				},
-			},
+		req := container.DeviceRequest{
+			Driver:       "nvidia",
+			Capabilities: [][]string{{"gpu"}},
+			DeviceIDs:    gpuDevices,
+			Count:        0, // Count 与 DeviceIDs 互斥，指定 IDs 时置 0
 		}
+		hostConfig.Resources = container.Resources{DeviceRequests: []container.DeviceRequest{req}}
 	}
 
 	// 创建容器
+	log.Printf("创建容器 镜像=%s cmd=%v env=%v volumes=%v gpus=%v", task.Image, config.Cmd, config.Env, hostConfig.Mounts, gpuDevices)
 	resp, err := dm.cli.ContainerCreate(ctx, config, hostConfig, nil, nil,
 		fmt.Sprintf("gcond-task-%s", task.ID))
 	if err != nil {
@@ -103,25 +101,21 @@ func (dm *DockerManager) WaitForContainer(containerID string) (int64, error) {
 // StopContainer 停止容器
 func (dm *DockerManager) StopContainer(containerID string) error {
 	ctx := context.Background()
-
 	timeout := 30 * time.Second
-	if err := dm.cli.ContainerStop(ctx, containerID, &timeout); err != nil {
+	seconds := int(timeout.Seconds())
+	options := container.StopOptions{Timeout: &seconds}
+	if err := dm.cli.ContainerStop(ctx, containerID, options); err != nil {
 		return fmt.Errorf("停止容器失败: %w", err)
 	}
-
 	return nil
 }
 
 // RemoveContainer 移除容器
 func (dm *DockerManager) RemoveContainer(containerID string) error {
 	ctx := context.Background()
-
-	if err := dm.cli.ContainerRemove(ctx, containerID, types.ContainerRemoveOptions{
-		Force: true,
-	}); err != nil {
+	if err := dm.cli.ContainerRemove(ctx, containerID, types.ContainerRemoveOptions{Force: true}); err != nil {
 		return fmt.Errorf("移除容器失败: %w", err)
 	}
-
 	return nil
 }
 
@@ -184,8 +178,6 @@ func (dm *DockerManager) ListContainers() ([]types.Container, error) {
 
 // CleanupContainers 清理容器
 func (dm *DockerManager) CleanupContainers() error {
-	ctx := context.Background()
-
 	containers, err := dm.ListContainers()
 	if err != nil {
 		return err

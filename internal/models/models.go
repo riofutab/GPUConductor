@@ -91,14 +91,18 @@ type Task struct {
 	ErrorMessage   string `json:"error_message"`
 
 	// 业务扩展
-	DatasetPath     string `json:"dataset_path"`
-	MinioEndpoint   string `json:"minio_endpoint"`
-	MinioBucket     string `json:"minio_bucket"`
-	MinioAccessKey  string `json:"minio_access_key"`
-	MinioSecretKey  string `json:"minio_secret_key"`
-	ModelOutputPath string `json:"model_output_path"`
-	ScriptPath      string `json:"script_path"`
-	Iterations      int    `json:"iterations"`
+	DatasetPath          string             `json:"dataset_path"`
+	MinioEndpoint        string             `json:"minio_endpoint"`
+	MinioBucket          string             `json:"minio_bucket"`
+	MinioAccessKey       string             `json:"minio_access_key"`
+	MinioSecretKey       string             `json:"minio_secret_key"`
+	ModelOutputPath      string             `json:"model_output_path"`
+	ModelOutputContainer string             `json:"model_output_container"`
+	ScriptPath           string             `json:"script_path"`
+	CodeRepo             string             `json:"code_repo"`
+	Iterations           int                `json:"iterations"`
+	CurrentIteration     int                `json:"current_iteration"`
+	Metrics              map[string]float64 `json:"metrics" gorm:"serializer:json"`
 
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
@@ -110,6 +114,13 @@ type TaskLog struct {
 	TaskID    string    `json:"task_id"`
 	Content   string    `json:"content"`
 	Timestamp time.Time `json:"timestamp"`
+}
+
+// Setting 简单的键值配置
+type Setting struct {
+	Key       string    `json:"key" gorm:"primaryKey"`
+	Value     string    `json:"value"`
+	UpdatedAt time.Time `json:"updated_at"`
 }
 
 // BeforeCreate 在创建前生成UUID

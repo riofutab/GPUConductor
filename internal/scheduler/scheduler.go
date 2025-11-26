@@ -20,12 +20,12 @@ type Scheduler struct {
 	cancel      context.CancelFunc
 }
 
-func New(db *gorm.DB, redisAddr string) *Scheduler {
+func New(db *gorm.DB, redisOpts *redis.Options) *Scheduler {
 	ctx, cancel := context.WithCancel(context.Background())
-
-	rdb := redis.NewClient(&redis.Options{
-		Addr: redisAddr,
-	})
+	if redisOpts == nil {
+		redisOpts = &redis.Options{Addr: "localhost:6379"}
+	}
+	rdb := redis.NewClient(redisOpts)
 
 	return &Scheduler{
 		db:          db,
@@ -164,7 +164,7 @@ func (s *Scheduler) hasEnoughGPUResources(node *models.Node, task *models.Task) 
 // assignTaskToNode 将任务分配给节点
 func (s *Scheduler) assignTaskToNode(task *models.Task, node *models.Node) error {
 	task.Status = "running"
-	task.AssignedNodeID = node.ID
+	task.AssignedNodeID = node.Address
 	now := time.Now()
 	task.StartedAt = &now
 

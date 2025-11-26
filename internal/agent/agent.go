@@ -14,6 +14,7 @@ import (
 	"io"
 	"io/fs"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -22,6 +23,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-redis/redis/v8"
@@ -50,6 +52,8 @@ type Agent struct {
 	dockerMgr   *docker.DockerManager
 	ctx         context.Context
 	cancel      context.CancelFunc
+	gpuMu       sync.Mutex
+	gpuInUse    map[string]bool
 }
 
 const defaultS3Region = "us-east-1"
@@ -64,11 +68,12 @@ func New(config *config.Config) *Agent {
 	}
 
 	return &Agent{
-		config: config,
-		nodeID: node.ID,
-		node:   node,
-		ctx:    ctx,
-		cancel: cancel,
+		config:   config,
+		nodeID:   node.ID,
+		node:     node,
+		ctx:      ctx,
+		cancel:   cancel,
+		gpuInUse: make(map[string]bool),
 	}
 }
 
@@ -90,20 +95,25 @@ func (a *Agent) Start() error {
 	a.dockerMgr = dm
 
 	// 连接Redis (从服务器获取配置)
-	redisAddr, err := a.getRedisConfig()
+	redisAddr, redisPass, redisDB, err := a.getRedisConfig()
 	if err != nil {
 		log.Printf("获取Redis配置失败，使用默认配置: %v", err)
 		redisAddr = "localhost:6379"
 	}
 
-	a.redisClient = redis.NewClient(&redis.Options{
-		Addr: redisAddr,
-	})
+	if a.redisClient == nil {
+		a.redisClient = redis.NewClient(&redis.Options{
+			Addr:     redisAddr,
+			Password: redisPass,
+			DB:       redisDB,
+		})
+	}
 
 	// 启动各个组件
 	go a.heartbeatLoop()
 	go a.gpuMonitorLoop()
 	go a.taskListener()
+	go a.cleanupLoop()
 
 	log.Printf("Agent节点启动成功: %s", a.config.NodeName())
 
@@ -119,28 +129,55 @@ func (a *Agent) Stop() {
 	}
 }
 
+func (a *Agent) cleanupLoop() {
+	if a.dockerMgr == nil {
+		return
+	}
+
+	// 先执行一次，避免遗留容器
+	if err := a.dockerMgr.CleanupContainers(); err != nil {
+		log.Printf("清理容器失败: %v", err)
+	}
+
+	ticker := time.NewTicker(10 * time.Minute)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-a.ctx.Done():
+			return
+		case <-ticker.C:
+			if err := a.dockerMgr.CleanupContainers(); err != nil {
+				log.Printf("定时清理容器失败: %v", err)
+			}
+		}
+	}
+}
+
 // getRedisConfig 从服务器获取Redis配置
-func (a *Agent) getRedisConfig() (string, error) {
+func (a *Agent) getRedisConfig() (string, string, int, error) {
 	resp, err := http.Get(a.config.ServerURL() + "/api/v1/config/redis")
 	if err != nil {
-		return "", err
+		return "", "", 0, err
 	}
 	defer resp.Body.Close()
 
-	var config struct {
-		Redis string `json:"redis"`
+	var redisInfo struct {
+		Redis    string `json:"redis"`
+		Password string `json:"password"`
+		DB       int    `json:"db"`
 	}
 
-	if err := json.NewDecoder(resp.Body).Decode(&config); err != nil {
-		return "", err
+	if err := json.NewDecoder(resp.Body).Decode(&redisInfo); err != nil {
+		return "", "", 0, err
 	}
 
-	return config.Redis, nil
+	return redisInfo.Redis, redisInfo.Password, redisInfo.DB, nil
 }
 
 // heartbeatLoop 心跳循环
 func (a *Agent) heartbeatLoop() {
-	ticker := time.NewTicker(30 * time.Second)
+	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
 
 	for {
@@ -189,7 +226,33 @@ func (a *Agent) sendHeartbeat() {
 
 // getLocalIP 获取本地IP地址
 func (a *Agent) getLocalIP() string {
-	// 简单实现，实际可能需要更复杂的逻辑
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return "127.0.0.1"
+	}
+	for _, iface := range ifaces {
+		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		addrs, _ := iface.Addrs()
+		for _, addr := range addrs {
+			var ip net.IP
+			switch v := addr.(type) {
+			case *net.IPNet:
+				ip = v.IP
+			case *net.IPAddr:
+				ip = v.IP
+			}
+			if ip == nil || ip.IsLoopback() {
+				continue
+			}
+			ip = ip.To4()
+			if ip == nil {
+				continue
+			}
+			return ip.String()
+		}
+	}
 	return "127.0.0.1"
 }
 
@@ -277,48 +340,52 @@ func (a *Agent) taskListener() {
 // executeTask 执行任务
 func (a *Agent) executeTask(task *models.Task) {
 	log.Printf("开始执行任务: %s", task.Name)
-	a.updateTaskStatus(task, "running")
+	a.updateTaskStatus(task, "running", "")
 
 	go func() {
-		if err := a.runTaskContainer(task); err != nil {
-			a.reportTaskError(task, err.Error())
+		logs, err := a.runTaskContainer(task)
+		if err != nil {
+			a.reportTaskError(task, err.Error(), logs)
 			return
 		}
 
 		if err := a.uploadModelArtifacts(task); err != nil {
-			a.reportTaskError(task, fmt.Sprintf("模型上传失败: %v", err))
+			a.reportTaskError(task, fmt.Sprintf("模型上传失败: %v", err), logs)
 			return
 		}
 
 		exitCode := 0
 		task.ExitCode = &exitCode
-		a.updateTaskStatus(task, "completed")
+		a.updateTaskStatus(task, "completed", logs)
 		log.Printf("任务完成: %s", task.Name)
 	}()
 }
 
-func (a *Agent) runTaskContainer(task *models.Task) error {
+func (a *Agent) runTaskContainer(task *models.Task) (string, error) {
 	if a.dockerMgr == nil {
-		return fmt.Errorf("Docker未初始化")
+		return "", fmt.Errorf("Docker未初始化")
 	}
 
 	spec := cloneTask(task)
 
 	env := copyEnv(spec.Environment)
 	if spec.DatasetPath != "" {
-		if err := ensureDir(spec.DatasetPath); err != nil {
-			return fmt.Errorf("数据集目录无效: %w", err)
-		}
-		env["DATASET_PATH"] = "/workspace/dataset"
-		spec.Volumes = append(spec.Volumes, fmt.Sprintf("%s:/workspace/dataset:ro", spec.DatasetPath))
+		// 数据集路径作为远端/MinIO路径传给容器，由训练脚本自行下载
+		env["DATASET_PATH"] = spec.DatasetPath
 	}
 
 	if spec.ModelOutputPath != "" {
 		if err := os.MkdirAll(spec.ModelOutputPath, 0o755); err != nil {
-			return fmt.Errorf("创建模型输出目录失败: %w", err)
+			return "", fmt.Errorf("创建模型输出目录失败: %w", err)
 		}
+	}
+	if spec.ModelOutputContainer != "" {
+		env["MODEL_OUTPUT_PATH"] = spec.ModelOutputContainer
+	} else {
 		env["MODEL_OUTPUT_PATH"] = "/workspace/output"
-		spec.Volumes = append(spec.Volumes, fmt.Sprintf("%s:/workspace/output", spec.ModelOutputPath))
+	}
+	if spec.ModelOutputPath != "" {
+		spec.Volumes = append(spec.Volumes, fmt.Sprintf("%s:%s", spec.ModelOutputPath, env["MODEL_OUTPUT_PATH"]))
 	}
 
 	if spec.Iterations > 0 {
@@ -335,40 +402,114 @@ func (a *Agent) runTaskContainer(task *models.Task) error {
 		env["MINIO_ACCESS_KEY"] = spec.MinioAccessKey
 		env["MINIO_SECRET_KEY"] = spec.MinioSecretKey
 	}
+	if spec.CodeRepo != "" {
+		env["CODE_REPO"] = spec.CodeRepo
+	}
 
 	spec.Environment = env
+	// 如果提供了脚本路径，则优先执行该脚本，避免与启动命令冲突
+	cmd := strings.TrimSpace(spec.Command)
+	if spec.ScriptPath != "" {
+		cmd = fmt.Sprintf("bash %s", spec.ScriptPath)
+	}
+	if cmd == "" {
+		return "", fmt.Errorf("启动命令不能为空")
+	}
+	spec.Command = cmd
 
 	devices, err := a.dockerMgr.GetGPUDevices()
 	if err != nil {
-		return err
+		return "", err
 	}
 
-	if spec.GPUCount > len(devices) {
-		return fmt.Errorf("节点可用GPU不足，要求: %d, 可用: %d", spec.GPUCount, len(devices))
+	allocated, err := a.allocateGPUs(devices, spec.GPUCount)
+	if err != nil {
+		return "", err
 	}
-
-	allocated := devices
-	if spec.GPUCount > 0 && spec.GPUCount < len(devices) {
-		allocated = devices[:spec.GPUCount]
-	}
+	defer a.releaseGPUs(allocated)
 
 	containerID, err := a.dockerMgr.StartContainer(&spec, allocated)
 	if err != nil {
-		return err
+		return "", err
 	}
 	task.ContainerID = containerID
+	a.updateTaskStatus(task, "running", "")
 
 	exitCode, err := a.dockerMgr.WaitForContainer(containerID)
-	if err != nil {
-		return err
+	logs := a.collectContainerLogs(containerID)
+	if err := a.dockerMgr.RemoveContainer(containerID); err != nil {
+		log.Printf("移除容器失败: %v", err)
 	}
+
+	if err != nil {
+		return logs, err
+	}
+
+	code := int(exitCode)
+	task.ExitCode = &code
 
 	if exitCode != 0 {
-		logs, _ := a.dockerMgr.GetContainerLogs(containerID)
-		return fmt.Errorf("容器退出码 %d: %s", exitCode, logs)
+		return logs, fmt.Errorf("容器退出码 %d", exitCode)
 	}
 
-	return nil
+	return logs, nil
+}
+
+func (a *Agent) collectContainerLogs(containerID string) string {
+	if a.dockerMgr == nil || containerID == "" {
+		return ""
+	}
+
+	logs, err := a.dockerMgr.GetContainerLogs(containerID)
+	if err != nil {
+		log.Printf("获取容器日志失败: %v", err)
+		return ""
+	}
+
+	return truncateLogs(logs)
+}
+
+func truncateLogs(logs string) string {
+	const maxLogSize = 20000
+	if len(logs) > maxLogSize {
+		return logs[len(logs)-maxLogSize:]
+	}
+	return logs
+}
+
+// GPU 申请与释放，防止同一节点重复分配
+func (a *Agent) allocateGPUs(all []string, count int) ([]string, error) {
+	if count <= 0 {
+		return nil, nil
+	}
+	a.gpuMu.Lock()
+	defer a.gpuMu.Unlock()
+
+	free := make([]string, 0, len(all))
+	for _, id := range all {
+		if !a.gpuInUse[id] {
+			free = append(free, id)
+		}
+	}
+	if len(free) < count {
+		return nil, fmt.Errorf("节点可用GPU不足，要求: %d, 可用: %d", count, len(free))
+	}
+	allocated := free[:count]
+	for _, id := range allocated {
+		a.gpuInUse[id] = true
+	}
+	return allocated, nil
+}
+
+func (a *Agent) releaseGPUs(ids []string) {
+	if len(ids) == 0 {
+		return
+	}
+	a.gpuMu.Lock()
+	defer a.gpuMu.Unlock()
+	for _, id := range ids {
+		delete(a.gpuInUse, id)
+	}
 }
 
 func cloneTask(task *models.Task) models.Task {
@@ -410,15 +551,29 @@ func ensureDir(path string) error {
 }
 
 // updateTaskStatus 更新任务状态
-func (a *Agent) updateTaskStatus(task *models.Task, status string) {
+func (a *Agent) updateTaskStatus(task *models.Task, status string, logs string) {
 	task.Status = status
-	now := time.Now()
 
-	if status == "completed" || status == "failed" {
-		task.CompletedAt = &now
+	payload := map[string]interface{}{
+		"status":           status,
+		"assigned_node_id": task.AssignedNodeID,
+		"container_id":     task.ContainerID,
 	}
 
-	data, err := json.Marshal(task)
+	if task.ExitCode != nil {
+		payload["exit_code"] = task.ExitCode
+	}
+	if task.ErrorMessage != "" {
+		payload["error_message"] = task.ErrorMessage
+	}
+	if len(task.Environment) > 0 {
+		payload["environment"] = task.Environment
+	}
+	if strings.TrimSpace(logs) != "" {
+		payload["logs"] = logs
+	}
+
+	data, err := json.Marshal(payload)
 	if err != nil {
 		log.Printf("序列化任务状态失败: %v", err)
 		return
@@ -442,13 +597,11 @@ func (a *Agent) updateTaskStatus(task *models.Task, status string) {
 }
 
 // reportTaskError 报告任务错误
-func (a *Agent) reportTaskError(task *models.Task, errorMsg string) {
+func (a *Agent) reportTaskError(task *models.Task, errorMsg string, logs string) {
 	task.Status = "failed"
 	task.ErrorMessage = errorMsg
-	now := time.Now()
-	task.CompletedAt = &now
 
-	a.updateTaskStatus(task, "failed")
+	a.updateTaskStatus(task, "failed", logs)
 	log.Printf("任务错误: %s - %s", task.Name, errorMsg)
 }
 

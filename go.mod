@@ -26,7 +26,6 @@ require (
 	github.com/cespare/xxhash/v2 v2.1.2 // indirect
 	github.com/chenzhuoyu/base64x v0.0.0-20221115062448-fe3a3abad311 // indirect
 	github.com/dgryski/go-rendezvous v0.0.0-20200823014737-9f7001d12a5f // indirect
-	github.com/distribution/reference v0.6.0 // indirect
 	github.com/docker/distribution v2.8.3+incompatible // indirect
 	github.com/docker/go-connections v0.6.0 // indirect
 	github.com/docker/go-units v0.5.0 // indirect
@@ -88,3 +87,5 @@ require (
 replace github.com/docker/docker/api => github.com/moby/moby/api v0.0.0-20231020142424-a3c7a3d4b91c
 
 replace github.com/docker/docker/client => github.com/moby/moby/client v0.0.0-20231020142424-a3c7a3d4b91c
+
+replace github.com/docker/distribution => github.com/docker/distribution v2.8.0+incompatible

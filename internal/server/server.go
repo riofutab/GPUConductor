@@ -18,9 +18,13 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/go-redis/redis/v8"
 	"go.uber.org/zap"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
@@ -106,7 +110,13 @@ func (s *Server) Start() error {
 	// 初始化调度器
 	redisAddr := fmt.Sprintf("%s:%d", s.config.Redis.Host, s.config.Redis.Port)
 	s.redisAddr = redisAddr
-	s.scheduler = scheduler.New(s.db, redisAddr)
+	redisOpts := &redis.Options{
+		Addr:     redisAddr,
+		Password: s.config.Redis.Password,
+		DB:       s.config.Redis.DB,
+		PoolSize: s.config.Redis.PoolSize,
+	}
+	s.scheduler = scheduler.New(s.db, redisOpts)
 	go s.scheduler.Start()
 	logger.Info("任务调度器已启动")
 
@@ -176,6 +186,7 @@ func (s *Server) initDatabase() error {
 		&models.GPU{},
 		&models.Task{},
 		&models.TaskLog{},
+		&models.Setting{},
 	)
 	if err != nil {
 		logger.Error("数据库表迁移失败", zap.Error(err))
@@ -212,16 +223,39 @@ func (s *Server) initRoutes() {
 	s.router = gin.New()
 	s.router.Use(gin.Logger(), gin.Recovery())
 
-	// 根路径返回 API 信息
-	s.router.GET("/", func(c *gin.Context) {
-		c.JSON(http.StatusOK, gin.H{
-			"name":      "GPUConductor",
-			"version":   "api-only",
-			"endpoints": []string{"/api/v1/health", "/api/v1/tasks", "/api/v1/nodes"},
-		})
-	})
+	uiDir := "ui-dist"
+	spaEnabled := dirExists(uiDir)
+	var serveIndex gin.HandlerFunc
+
+	if spaEnabled {
+		assetsDir := filepath.Join(uiDir, "assets")
+		if dirExists(assetsDir) {
+			s.router.Static("/assets", assetsDir)
+		}
+		serveIndex = func(c *gin.Context) {
+			c.File(filepath.Join(uiDir, "index.html"))
+		}
+		s.router.GET("/", serveIndex)
+		s.router.GET("/login", serveIndex)
+		s.router.GET("/tasks", serveIndex)
+		s.router.GET("/nodes", serveIndex)
+		s.router.GET("/dashboard", serveIndex)
+	} else {
+		serveIndex = func(c *gin.Context) {
+			c.JSON(http.StatusOK, gin.H{
+				"name":      "GPUConductor",
+				"version":   "api-only",
+				"endpoints": []string{"/api/v1/health", "/api/v1/tasks", "/api/v1/nodes"},
+			})
+		}
+		s.router.GET("/", serveIndex)
+	}
 
 	s.router.NoRoute(func(c *gin.Context) {
+		if spaEnabled && !strings.HasPrefix(c.Request.URL.Path, "/api/") {
+			serveIndex(c)
+			return
+		}
 		c.JSON(http.StatusNotFound, gin.H{"error": "endpoint not found"})
 	})
 
@@ -230,7 +264,7 @@ func (s *Server) initRoutes() {
 	if graceSeconds <= 0 {
 		graceSeconds = 60
 	}
-	apiHandler := api.NewHandler(s.db, s.scheduler, s.redisAddr, time.Duration(graceSeconds)*time.Second)
+	apiHandler := api.NewHandler(s.db, s.scheduler, s.redisAddr, s.config.Redis.Password, s.config.Redis.DB, time.Duration(graceSeconds)*time.Second)
 
 	// 公开路由
 	publicGroup := s.router.Group("/api/v1")
@@ -248,6 +282,8 @@ func (s *Server) initRoutes() {
 	{
 		// 用户管理
 		apiGroup.GET("/users/profile", apiHandler.GetUserProfile)
+		apiGroup.GET("/users", apiHandler.GetUsers)
+		apiGroup.PUT("/users/:id/role", apiHandler.UpdateUserRole)
 
 		// 节点管理
 		apiGroup.GET("/nodes", apiHandler.GetNodes)
@@ -263,6 +299,9 @@ func (s *Server) initRoutes() {
 		apiGroup.GET("/stats", apiHandler.GetStats)
 		apiGroup.GET("/stats/gpus", apiHandler.GetGPUStats)
 		apiGroup.GET("/gpu/stats", apiHandler.GetGPUStats)
+		// GitLab 功能已下线，接口不再暴露
+		apiGroup.GET("/settings/ldap", apiHandler.GetLDAPConfig)
+		apiGroup.PUT("/settings/ldap", apiHandler.UpdateLDAPConfig)
 
 		// 节点管理
 		apiGroup.PUT("/nodes/:id/status", apiHandler.UpdateNodeStatus)
@@ -322,4 +361,9 @@ func (s *Server) initJWT() {
 	}
 
 	auth.InitJWT(cfg)
+}
+
+func dirExists(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && info.IsDir()
 }

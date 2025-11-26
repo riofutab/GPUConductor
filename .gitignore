@@ -79,3 +79,4 @@ node_modules/
 # Compiled frontend assets (keep the embedded ones)
 web/dist/*
 !web/dist/index.html
+ui-dist/
